@@ -1,0 +1,9 @@
+services:
+  github-mcp:
+    image: lqdflying/githubmcp:v1.0.0
+    container_name: github-mcp
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    env_file:
+      - .env
+    restart: unless-stopped
