@@ -11,3 +11,4 @@ venv*/
 .ruff_cache/
 *.egg
 mcp.json
+.github/copilot-instructions.md

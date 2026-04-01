@@ -202,16 +202,18 @@ docker compose down           # stop
 ## Architecture
 
 ```
-server.py                    ← FastMCP entry point; auth setup + hello_world sample tool
+server.py                    ← FastMCP entry point; thin @mcp.tool() wrappers only
 src/
-└── auth/
-    ├── __init__.py          ← Exports setup_auth(), parse_bool()
-    ├── oauth.py            ← RFC 8252 loopback CIMD, scope normalization, TokenOrGitHubOAuthProvider
-    ├── token.py            ← Static token verifier factory (DebugTokenVerifier)
-    └── provider.py         ← setup_auth() reads env vars and returns configured provider
+├── auth/
+│   ├── __init__.py          ← Exports setup_auth(), parse_bool()
+│   ├── oauth.py             ← RFC 8252 loopback CIMD, scope normalization, TokenOrGitHubOAuthProvider
+│   ├── token.py             ← Static token verifier factory (DebugTokenVerifier)
+│   └── provider.py          ← setup_auth() reads env vars and returns configured provider
+└── tools/
+    └── sample_tools.py      ← Pure async functions; no FastMCP imports
 tests/
 ├── conftest.py              ← Shared test fixtures
-└── test_hello_world.py     ← Tests for the sample tool
+└── test_hello_world.py      ← Tests for the sample tool
 ```
 
 ### Auth Code Structure
@@ -224,22 +226,28 @@ The authentication implementation in `src/auth/` handles:
 
 ### Adding Your Own Tools
 
-Tools follow this pattern:
+Tools use a two-layer pattern: a thin `@mcp.tool()` wrapper in `server.py` delegates to a pure async function in `src/tools/`. This keeps all logic independently testable.
+
+**Step 1** — Add the implementation in `src/tools/sample_tools.py` (or a new file):
 
 ```python
-@mcp.tool(tags={"category"})
-async def my_tool(param: str, optional_param: str | None = None) -> str:
-    """Tool description.
-
-    Args:
-        param: Description of param.
-        optional_param: Optional parameter description.
-    """
-    # Your implementation
-    return result
+async def my_tool(param: str) -> str:
+    """Tool description."""
+    return f"Result: {param}"
 ```
 
-The `@mcp.tool()` decorator registers the function as an MCP tool. Tags are used for filtering, and the docstring becomes the tool description.
+**Step 2** — Import and wrap it in `server.py`:
+
+```python
+from src.tools.sample_tools import my_tool
+
+@mcp.tool(tags={"category"})
+async def my_tool_wrapper(param: str) -> str:
+    """Tool description."""
+    return await my_tool(param)
+```
+
+The `@mcp.tool()` decorator registers the function as an MCP tool. Tags are used for filtering.
 
 ---
 
@@ -260,8 +268,3 @@ ruff check .
 ruff format .
 ```
 
----
-
-## License
-
-MIT
