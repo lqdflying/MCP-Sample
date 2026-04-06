@@ -11,3 +11,5 @@ venv*/
 .ruff_cache/
 *.egg
 mcp.json
+.vscode/*
+!.vscode/settings.json
