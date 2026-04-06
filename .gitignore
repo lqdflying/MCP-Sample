@@ -12,3 +12,5 @@ venv*/
 *.egg
 mcp.json
 .github/copilot-instructions.md
+.vscode/*
+!.vscode/settings.json
