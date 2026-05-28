@@ -1,89 +1,16 @@
-"""GitHub OAuth authentication provider.
+"""GitHub OAuth authentication utilities.
 
-Implements RFC 8252 loopback-aware CIMD manager, GitHub OAuth scope
-normalization, and the hybrid TokenOrGitHubOAuthProvider that accepts
-either a static MCP_API_TOKEN or a GitHub OAuth token.
+Provides GitHub OAuth scope normalization helpers and factory functions for
+building the GitHubProvider (OAuth 2.1 proxy flow) and GitHubTokenVerifier
+(OAuth 2.0 raw token validation) used by MultiAuth.
 """
 
-import hmac
 import logging
-from urllib.parse import urlparse
 
-from fastmcp.server.auth import AccessToken
-from fastmcp.server.auth.cimd import CIMDClientManager
+from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.providers.github import GitHubProvider, GitHubTokenVerifier
 
 log = logging.getLogger("mcp")
-
-# ── RFC 8252 loopback-aware CIMD manager ─────────────────────────────
-# VS Code's CIMD document lists a fixed loopback port but sends a dynamic
-# port at runtime. Per RFC 8252 §7.3 the port MUST be ignored for loopback
-# redirect URIs. This manager normalizes fixed ports to wildcard patterns.
-
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-
-
-def _normalize_loopback_redirect_uris(redirect_uris: list[str]) -> list[str]:
-    """Replace fixed loopback ports with :* wildcards per RFC 8252."""
-    normalized = []
-    for uri in redirect_uris:
-        parsed = urlparse(uri.rstrip("/"))
-        host = (parsed.hostname or "").lower()
-        if host in _LOOPBACK_HOSTS and parsed.scheme == "http" and parsed.port:
-            normalized.append(f"http://{host}:*/")
-        else:
-            normalized.append(uri)
-    return normalized
-
-
-_LOOPBACK_REDIRECT_PATTERNS = ["http://127.0.0.1:*/", "http://localhost:*/"]
-
-
-class _RFC8252CIMDManager(CIMDClientManager):
-    """CIMD manager that normalizes fixed loopback ports to wildcards (RFC 8252).
-
-    Also supports pre-registered static client IDs for legacy MCP clients that
-    do not use CIMD dynamic registration (e.g. older VS Code versions).
-    """
-
-    def __init__(self, *, static_client_ids: list[str] | None = None, **kwargs):
-        super().__init__(**kwargs)
-        self._static_client_ids: set[str] = set(static_client_ids or [])
-
-    def is_cimd_client_id(self, client_id: str) -> bool:
-        """Return True for static pre-registered IDs in addition to CIMD URLs."""
-        return client_id in self._static_client_ids or super().is_cimd_client_id(client_id)
-
-    async def get_client(self, client_id_url: str):
-        # Pre-registered static client IDs (legacy clients without CIMD support).
-        if client_id_url in self._static_client_ids:
-            from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
-
-            patterns = self.allowed_redirect_uri_patterns or _LOOPBACK_REDIRECT_PATTERNS
-            return ProxyDCRClient(
-                client_id=client_id_url,
-                client_secret=None,
-                redirect_uris=None,
-                scope=self.default_scope,
-                allowed_redirect_uri_patterns=patterns,
-                client_name=client_id_url,
-            )
-
-        client = await super().get_client(client_id_url)
-        if client is None or client.cimd_document is None:
-            return client
-
-        doc = client.cimd_document
-        if not doc.redirect_uris:
-            return client
-
-        normalized = _normalize_loopback_redirect_uris(doc.redirect_uris)
-        if normalized != list(doc.redirect_uris):
-            new_doc = doc.model_copy(update={"redirect_uris": normalized})
-            client = client.model_copy(update={"cimd_document": new_doc})
-
-        return client
-
 
 # ── GitHub scope normalization ────────────────────────────────────────
 # GitHub App tokens return only a broad parent scope (or nothing) via
@@ -118,105 +45,98 @@ def normalize_oauth_scopes(scopes: list[str]) -> list[str]:
     return result
 
 
-# ── Hybrid auth provider ──────────────────────────────────────────────
+# ── Login allowlist filtering ─────────────────────────────────────────
+# GitHubProvider doesn't have a built-in login allowlist. We wrap the token
+# verifier and the provider to check the GitHub login claim after successful
+# verification.
 
 
-class TokenOrGitHubOAuthProvider(GitHubProvider):
-    """Accept either a shared static token or GitHub OAuth tokens.
+class LoginFilteredGitHubTokenVerifier(GitHubTokenVerifier):
+    """GitHubTokenVerifier that additionally checks the login claim against an allowlist.
 
-    Keeps existing automation that uses MCP_API_TOKEN working while enabling
-    Power Automate / VS Code OAuth flows on the same MCP endpoint.
+    Delegates token verification to the upstream GitHub API via the parent
+    GitHubTokenVerifier, then checks the returned ``login`` claim.  Tokens
+    from non-allowlisted users are rejected even if they are otherwise valid.
     """
 
     def __init__(
         self,
         *,
-        mcp_api_token: str | None,
-        allow_static_token: bool,
         allowed_github_logins: set[str] | None = None,
         audit_logging_enabled: bool = False,
         **kwargs,
     ):
-        # Capture client_id before passing to super — used to register it as a
-        # static MCP client ID so legacy VS Code versions (which send the server's
-        # GitHub OAuth App client_id instead of a CIMD URL) can authenticate.
-        github_client_id: str | None = kwargs.get("client_id")
         super().__init__(**kwargs)
-        self._mcp_api_token = mcp_api_token
-        self._allow_static_token = allow_static_token
         self._allowed_github_logins = {login.lower() for login in (allowed_github_logins or set())}
         self._audit_logging_enabled = audit_logging_enabled
 
-        # Replace the CIMD manager with an RFC 8252-aware version that:
-        # 1. Normalizes fixed loopback ports to wildcards (RFC 8252 §7.3)
-        # 2. Sets default_scope so CIMD clients that don't declare a scope
-        #    (e.g. VS Code) are allowed to request the server's required scopes.
-        # 3. Registers GITHUB_CLIENT_ID as a static client so legacy MCP clients
-        #    (older VS Code) that send it as client_id instead of a CIMD URL work.
-        if self._cimd_manager is not None:
-            default_scope = " ".join(self.required_scopes) if self.required_scopes else None
-            static_ids = [github_client_id] if github_client_id else None
-            self._cimd_manager = _RFC8252CIMDManager(
-                enable_cimd=True,
-                default_scope=default_scope,
-                allowed_redirect_uri_patterns=self._allowed_client_redirect_uris,
-                static_client_ids=static_ids,
-            )
+    async def verify_token(self, token: str) -> AccessToken | None:
+        access_token = await super().verify_token(token)
+        if access_token is None:
+            return None
+        return _check_login_allowlist(
+            access_token,
+            allowed_logins=self._allowed_github_logins,
+            audit_logging_enabled=self._audit_logging_enabled,
+        )
+
+
+class LoginFilteredGitHubProvider(GitHubProvider):
+    """GitHubProvider that additionally checks the login claim against an allowlist.
+
+    Wraps the OAuth 2.1 proxy flow's token verification with login filtering
+    so that only allowlisted GitHub users can authenticate through the proxy.
+    """
+
+    def __init__(
+        self,
+        *,
+        allowed_github_logins: set[str] | None = None,
+        audit_logging_enabled: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._allowed_github_logins = {login.lower() for login in (allowed_github_logins or set())}
+        self._audit_logging_enabled = audit_logging_enabled
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        # Step 1: Static MCP_API_TOKEN (constant-time compare).
-        if (
-            self._allow_static_token
-            and self._mcp_api_token
-            and hmac.compare_digest(token, self._mcp_api_token)
-        ):
-            if self._audit_logging_enabled:
-                log.info("AUTH success method=token")
-            return AccessToken(
-                token=token,
-                client_id="mcp-token-client",
-                scopes=list(self.required_scopes) if self.required_scopes else ["read"],
-                claims={"auth_mode": "static_token"},
-            )
-
-        # Step 2: FastMCP proxy token (VS Code, Copilot Studio via server proxy).
         access_token = await super().verify_token(token)
-
-        # Step 3: Raw GitHub OAuth token (e.g. Power Automate custom connector
-        # obtaining a token directly from GitHub rather than through the proxy).
         if access_token is None:
-            raw_verifier = GitHubTokenVerifier(
-                required_scopes=list(self.required_scopes) if self.required_scopes else None,
-            )
-            access_token = await raw_verifier.verify_token(token)
-            if access_token is not None and self._audit_logging_enabled:
-                login = access_token.claims.get("login")
-                log.info(
-                    f"AUTH token type=raw_github login={login if isinstance(login, str) else 'unknown'}"
-                )
-
-        if access_token is None:
-            if self._audit_logging_enabled:
-                log.warning("AUTH failed method=oauth_or_token reason=invalid_or_expired")
             return None
+        return _check_login_allowlist(
+            access_token,
+            allowed_logins=self._allowed_github_logins,
+            audit_logging_enabled=self._audit_logging_enabled,
+        )
 
-        if not self._allowed_github_logins:
-            if self._audit_logging_enabled:
-                login = access_token.claims.get("login")
-                login_label = login if isinstance(login, str) else "unknown"
-                log.info(f"AUTH success method=oauth login={login_label}")
-            return access_token
 
-        login = access_token.claims.get("login")
-        if isinstance(login, str) and login.lower() in self._allowed_github_logins:
-            if self._audit_logging_enabled:
-                log.info(f"AUTH success method=oauth login={login}")
-            return access_token
+def _check_login_allowlist(
+    access_token: AccessToken,
+    *,
+    allowed_logins: set[str],
+    audit_logging_enabled: bool,
+) -> AccessToken | None:
+    """Check the login claim against the allowlist.
 
-        if self._audit_logging_enabled:
-            blocked_login = login if isinstance(login, str) else "unknown"
-            log.warning(
-                f"AUTH rejected method=oauth login={blocked_login} reason=login_not_allowlisted"
-            )
+    Returns the access token if the user is allowed or no allowlist is set.
+    Returns None if the user is blocked.
+    """
+    if not allowed_logins:
+        if audit_logging_enabled:
+            login = access_token.claims.get("login")
+            login_label = login if isinstance(login, str) else "unknown"
+            log.info(f"AUTH success method=oauth login={login_label}")
+        return access_token
 
-        return None
+    login = access_token.claims.get("login")
+    if isinstance(login, str) and login.lower() in allowed_logins:
+        if audit_logging_enabled:
+            log.info(f"AUTH success method=oauth login={login}")
+        return access_token
+
+    if audit_logging_enabled:
+        blocked_login = login if isinstance(login, str) else "unknown"
+        log.warning(
+            f"AUTH rejected method=oauth login={blocked_login} reason=login_not_allowlisted"
+        )
+    return None

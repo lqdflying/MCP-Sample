@@ -6,8 +6,8 @@ A minimal FastMCP server demonstrating a well-designed authentication architectu
 - Dual mode accepting either auth method
 
 This serves as a reference implementation for building MCP servers with
-production-ready authentication. All GitHub-specific code has been removed
-to leave a clean authentication sample.
+production-ready authentication. All GitHub-specific tool code has been
+removed to leave a clean authentication sample.
 """
 
 import logging
@@ -49,9 +49,8 @@ async def lifespan(server: FastMCP):
 def create_server() -> FastMCP:
     """Construct and configure the FastMCP server.
 
-    This function is called only when starting the server, not when
-    importing the module. This allows tool implementations to be imported
-    and tested independently without triggering auth setup.
+    Called only when starting the server, not at import time, so tool
+    implementations can be imported and tested without triggering auth setup.
     """
     auth = setup_auth()
 
@@ -118,7 +117,7 @@ def create_server() -> FastMCP:
         Args:
             name: The name to greet. Defaults to "World".
         """
-        return hello_world(name)
+        return await hello_world(name)
 
     return mcp
 

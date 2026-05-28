@@ -1,270 +1,94 @@
 # MCP Authentication Sample
 
-A minimal **FastMCP** server demonstrating a well-designed authentication architecture. This project serves as a reference implementation showing how to build MCP servers with production-ready authentication patterns.
+A minimal **FastMCP** server that demonstrates a production-ready authentication
+architecture for MCP servers. It ships with one sample tool (`hello_world_tool`)
+so the focus stays on the auth layer.
 
-The sample includes a single `hello_world` tool to demonstrate the basic tool structure, while the focus is on the authentication layer.
+Supported auth modes:
 
----
+- **token** — static bearer token (`MCP_API_TOKEN`)
+- **oauth** — GitHub OAuth (OAuth 2.1 proxy + OAuth 2.0 raw token verifier)
+- **both** — accept either method on the same server (default)
 
-## Table of Contents
+GitHub OAuth includes an optional **login allowlist** so you can restrict access
+to specific GitHub users, and a structured **audit log** for every auth decision.
 
-- [Authentication Architecture](#authentication-architecture)
-- [Auth Modes](#auth-modes)
-- [Prerequisites](#prerequisites)
-- [Setup](#setup)
-- [Running the Server](#running-the-server)
-- [Docker Deployment](#docker-deployment)
-- [Environment Variables Reference](#environment-variables-reference)
-- [Architecture](#architecture)
-- [Development](#development)
-
----
-
-## Authentication Architecture
-
-There are **two separate and independent authentication layers**:
+## Project layout
 
 ```
-MCP Client (VS Code / Copilot Studio / any MCP client)
-        │
-        │  Layer 1 — "Who are you?"
-        │  Proved by: MCP_API_TOKEN (static)
-        │              or GitHub OAuth token
-        ▼
-MCP Server (this server)
-        │
-        │  Layer 2 — "Access your resources"
-        │  (Application-specific; not shown here)
-        ▼
-Application
+server.py                — FastMCP server factory, middleware, /health, sample tool
+src/auth/provider.py     — setup_auth() reads env vars and builds the auth provider
+src/auth/oauth.py        — Login-filtered GitHubProvider + GitHubTokenVerifier
+src/auth/token.py        — Constant-time static token verifier
+src/tools/sample_tools.py — hello_world reference tool
+tests/                   — pytest suite for the sample tool
+docs/                    — Architecture diagrams (excalidraw) and OAuth callback notes
 ```
 
-### Auth Modes
-
-| `MCP_AUTH_MODE` | Who can connect | Best for |
-|-----------------|----------------|---------|
-| `token` | Anyone with the `MCP_API_TOKEN` value | Local / trusted environments |
-| `oauth` | GitHub accounts listed in `ALLOWED_GITHUB_LOGINS` | Remote deployments requiring identity |
-| `both` *(default)* | Either token or GitHub OAuth | Supporting multiple client types simultaneously |
-
----
-
-## Prerequisites
-
-- **Python 3.12+** (direct) or **Docker** (containerised)
-- For OAuth mode: A **GitHub App** registered in [GitHub Settings](https://github.com/settings/apps)
-
----
-
-## Setup
-
-### 1. Clone and install
+## Quick start
 
 ```bash
 git clone <this-repo-url>
 cd MCP-Sample
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -e .
-```
-
-### 2. Create your `.env`
-
-```bash
+source .venv/bin/activate
+pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-Edit `.env` based on your chosen auth mode (see below).
-
----
-
-## Running the Server
-
-### Option A — Static token (simplest)
-
-Best for local development or trusted environments.
+Edit `.env` and set at minimum:
 
 ```env
 MCP_AUTH_MODE=token
-MCP_API_TOKEN=your_secret_token_here
+MCP_API_TOKEN=your_secret_mcp_token_here
 ```
+
+Start the server:
 
 ```bash
 python server.py
 ```
 
-Connect clients using:
-```json
-{
-  "servers": {
-    "mcp-sample": {
-      "type": "http",
-      "url": "http://localhost:8000/mcp",
-      "headers": {
-        "Authorization": "Bearer your_secret_token_here"
-      }
-    }
-  }
-}
+Health check:
+
+```bash
+curl http://localhost:8000/health
 ```
 
-### Option B — GitHub OAuth (remote deployments)
+## Enabling GitHub OAuth
 
-Best for production deployments where you want GitHub identity verification.
-
-**Step 1 — Create a GitHub App**
-
-1. Go to **[GitHub → Settings → Developer Settings → GitHub Apps](https://github.com/settings/apps/new)**
-2. Fill in:
-   - **GitHub App name**: e.g. `my-mcp-auth-sample` (globally unique)
-   - **Homepage URL**: your server URL, e.g. `https://your-domain`
-   - **Callback URL**: `https://your-domain/auth/callback`
-   - **Webhook**: uncheck **Active**
-3. Under **Account permissions**: **Email addresses** → Read-only, **Profile** → Read-only
-4. **Where can this GitHub App be installed?** → **Only on this account**
-5. Click **Create GitHub App**, note the **Client ID**, and generate a **client secret**
-
-**Step 2 — Configure `.env`**
-
-```env
-MCP_AUTH_MODE=oauth
-GITHUB_CLIENT_ID=your_github_app_client_id
-GITHUB_CLIENT_SECRET=your_github_app_client_secret
-BASE_URL=https://your-domain
-ALLOWED_GITHUB_LOGINS=your-github-username
-```
-
-### Option C — Both token and OAuth simultaneously
+Register a [GitHub OAuth App](https://github.com/settings/developers) with the
+callback URL `${BASE_URL}/auth/callback`, then set:
 
 ```env
 MCP_AUTH_MODE=both
-MCP_API_TOKEN=your_secret_token_here
-GITHUB_CLIENT_ID=your_github_app_client_id
-GITHUB_CLIENT_SECRET=your_github_app_client_secret
-BASE_URL=https://your-domain
-ALLOWED_GITHUB_LOGINS=your-github-username
+GITHUB_CLIENT_ID=...
+GITHUB_CLIENT_SECRET=...
+BASE_URL=https://your-public-host.example.com
+GITHUB_OAUTH_SCOPES=read:user
+ALLOWED_GITHUB_LOGINS=your-github-login
 ```
 
----
+See [`docs/github-oauth-callback-guide.md`](docs/github-oauth-callback-guide.md)
+and [`docs/oauth-callback-workflows.md`](docs/oauth-callback-workflows.md) for
+the callback flow.
 
-## Docker Deployment
+## Adding your own tools
 
-### 1. Prepare the environment file
-
-```bash
-cp .env.example .env
-# Edit .env with your auth configuration
-```
-
-Example `.env` for dual auth:
-
-```env
-MCP_AUTH_MODE=both
-MCP_AUTH_AUDIT_LOG=true
-MCP_API_TOKEN=your_secret_mcp_token_here
-GITHUB_CLIENT_ID=your_oauth_client_id
-GITHUB_CLIENT_SECRET=your_oauth_client_secret
-BASE_URL=https://your-domain
-ALLOWED_GITHUB_LOGINS=your-github-username
-HOST=0.0.0.0
-PORT=8000
-```
-
-### 2. Start with Docker Compose
-
-```bash
-docker compose up -d          # start in background
-docker compose logs -f        # follow logs
-docker compose down           # stop
-```
-
----
-
-## Environment Variables Reference
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `MCP_AUTH_MODE` | No | `both` | `token` — static token only; `oauth` — GitHub OAuth only; `both` — either method accepted. **Note: `both` requires all three OAuth vars (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `BASE_URL`).** |
-| `MCP_AUTH_AUDIT_LOG` | No | `true` | Log auth decisions (method, login, allowlist result). Never logs token values. |
-| `MCP_API_TOKEN` | Conditional | — | Required when `MCP_AUTH_MODE=token` or `both`. The shared secret clients send as a Bearer token. |
-| `GITHUB_CLIENT_ID` | Conditional | — | GitHub App client ID. Required when OAuth is enabled. |
-| `GITHUB_CLIENT_SECRET` | Conditional | — | GitHub App client secret. Required when OAuth is enabled. |
-| `BASE_URL` | Conditional | — | Public HTTPS URL of this server. Required when OAuth is enabled. |
-| `ALLOWED_GITHUB_LOGINS` | **Strongly recommended** | *(empty = allow all)* | Comma-separated GitHub usernames permitted for OAuth. **Empty means any GitHub account can sign in.** |
-| `MCP_STATELESS` | No | `true` | `true` — stateless mode (default, recommended). `false` — stateful mode with SSE event replay via Redis. |
-| `UPSTASH_REDIS_REST_URL` | When `MCP_STATELESS=false` | — | Upstash Redis URL. |
-| `UPSTASH_REDIS_REST_TOKEN` | When `MCP_STATELESS=false` | — | Upstash Redis token. |
-| `HOST` | No | `0.0.0.0` | Network interface to bind to |
-| `PORT` | No | `8000` | Port to listen on |
-
----
-
-## Architecture
-
-```
-server.py                    ← FastMCP entry point; thin @mcp.tool() wrappers only
-src/
-├── auth/
-│   ├── __init__.py          ← Exports setup_auth(), parse_bool()
-│   ├── oauth.py             ← RFC 8252 loopback CIMD, scope normalization, TokenOrGitHubOAuthProvider
-│   ├── token.py             ← Static token verifier factory (DebugTokenVerifier)
-│   └── provider.py          ← setup_auth() reads env vars and returns configured provider
-└── tools/
-    └── sample_tools.py      ← Pure async functions; no FastMCP imports
-tests/
-├── conftest.py              ← Shared test fixtures
-└── test_hello_world.py      ← Tests for the sample tool
-```
-
-### Auth Code Structure
-
-The authentication implementation in `src/auth/` handles:
-
-1. **`provider.py`** — `setup_auth()` reads `MCP_AUTH_MODE` and returns the appropriate FastMCP auth provider
-2. **`oauth.py`** — RFC 8252 compliant OAuth 2.0 loopback redirect, GitHub scope normalization, and `TokenOrGitHubOAuthProvider` that tries token first then falls back to OAuth
-3. **`token.py`** — `build_token_verifier()` factory creating a constant-time comparison verifier using HMAC
-
-### Adding Your Own Tools
-
-Tools use a two-layer pattern: a thin `@mcp.tool()` wrapper in `server.py` delegates to a pure async function in `src/tools/`. This keeps all logic independently testable.
-
-**Step 1** — Add the implementation in `src/tools/sample_tools.py` (or a new file):
-
-```python
-async def my_tool(param: str) -> str:
-    """Tool description."""
-    return f"Result: {param}"
-```
-
-**Step 2** — Import and wrap it in `server.py`:
-
-```python
-from src.tools.sample_tools import my_tool
-
-@mcp.tool(tags={"category"})
-async def my_tool_wrapper(param: str) -> str:
-    """Tool description."""
-    return await my_tool(param)
-```
-
-The `@mcp.tool()` decorator registers the function as an MCP tool. Tags are used for filtering.
-
----
+`src/tools/sample_tools.py` is the template — define an `async` function and
+re-export it from `src/tools/__init__.py`. Then register it inside
+`create_server()` in `server.py` with `@mcp.tool(...)`.
 
 ## Development
 
 ```bash
-# Install with dev dependencies
 pip install -e ".[dev]"
-
-# Run all tests
-pytest tests/
-
-# Run a single test
-pytest tests/test_hello_world.py
-
-# Lint and format
+pytest
 ruff check .
-ruff format .
 ```
 
+## Docker
+
+```bash
+docker compose up --build
+```

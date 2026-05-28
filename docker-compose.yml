@@ -1,9 +1,16 @@
 services:
-  github-mcp:
-    image: lqdflying/githubmcp:v1.0.0
-    container_name: github-mcp
+  mcp-auth-sample:
+    build: .
+    container_name: mcp-auth-sample
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     env_file:
       - .env
+    environment:
+      - FASTMCP_HOME=/data/fastmcp
+    volumes:
+      - mcp-oauth-data:/data/fastmcp
     restart: unless-stopped
+
+volumes:
+  mcp-oauth-data:
