@@ -3,6 +3,11 @@
 Reads environment variables, validates them, and returns the configured
 FastMCP auth provider -- either a static DebugTokenVerifier for token-only
 mode, or a MultiAuth compositor for OAuth/both modes.
+
+Supports TWO operational modes:
+  - Lightweight (no policy DB): Static token auth only.
+  - Full (with policy DB): Per-user tokens via DbTokenVerifier + OAuth.
+    Activated when MCP_POLICY_DB_HOST is set.
 """
 
 import os
@@ -11,14 +16,14 @@ from pathlib import Path
 
 from fastmcp import settings as fastmcp_settings
 from fastmcp.server.auth import MultiAuth
-from key_value.aio.stores.memory import MemoryStore
 
 from .oauth import (
     LoginFilteredGitHubProvider,
     LoginFilteredGitHubTokenVerifier,
     normalize_oauth_scopes,
 )
-from .token import build_token_verifier
+from .oauth_url import normalize_loopback_oauth_url
+from .token import DbTokenVerifier, build_static_token_verifier
 
 _VALID_AUTH_MODES = {"token", "oauth", "both"}
 
@@ -44,9 +49,10 @@ def setup_auth():
     == Auth modes ==
 
     token  — static MCP_API_TOKEN only (DebugTokenVerifier)
+             OR per-user tokens from DB (DbTokenVerifier) when policy DB configured
     oauth  — GitHub OAuth only: MultiAuth with OAuth 2.1 proxy (GitHubProvider)
              + OAuth 2.0 raw token fallback (GitHubTokenVerifier)
-    both   — all three: static token + OAuth 2.1 proxy + OAuth 2.0 raw
+    both   — all three: token verifier(s) + OAuth 2.1 proxy + OAuth 2.0 raw
     """
     auth_mode = os.environ.get("MCP_AUTH_MODE", "both").strip().lower()
     if auth_mode not in _VALID_AUTH_MODES:
@@ -57,11 +63,15 @@ def setup_auth():
     need_oauth_auth = auth_mode in {"oauth", "both"}
     audit_logging_enabled = parse_bool(os.environ.get("MCP_AUTH_AUDIT_LOG", "true"), default=True)
 
+    # ── Policy DB mode detection ──────────────────────────────────────
+    policy_db_configured = bool(os.environ.get("MCP_POLICY_DB_HOST", "").strip())
+
     # ── Static token ──────────────────────────────────────────────────
     mcp_api_token = os.environ.get("MCP_API_TOKEN", "").strip()
-    if need_token_auth and not mcp_api_token:
+    if need_token_auth and not mcp_api_token and not policy_db_configured:
         print(
-            "ERROR: MCP_API_TOKEN environment variable is required for token auth mode.",
+            "ERROR: MCP_API_TOKEN environment variable is required for token auth mode "
+            "(unless MCP_POLICY_DB_HOST is configured for per-user tokens).",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -69,7 +79,7 @@ def setup_auth():
     # ── OAuth vars ────────────────────────────────────────────────────
     github_client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
     github_client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "").strip()
-    base_url = os.environ.get("BASE_URL", "").strip()
+    base_url = normalize_loopback_oauth_url(os.environ.get("BASE_URL", "").strip())
 
     oauth_vars = {
         "GITHUB_CLIENT_ID": github_client_id,
@@ -103,19 +113,21 @@ def setup_auth():
 
     # ── Token-only mode ───────────────────────────────────────────────
     if not need_oauth_auth:
-        return build_token_verifier(
+        if policy_db_configured:
+            # Per-user tokens from the policy database
+            return DbTokenVerifier(audit_logging_enabled=audit_logging_enabled)
+        return build_static_token_verifier(
             mcp_api_token=mcp_api_token,
             audit_logging_enabled=audit_logging_enabled,
         )
 
     # ── OAuth storage backend ─────────────────────────────────────────
     # GitHubProvider stores OAuth transactions, authorization codes,
-    # client registrations, and refresh token mappings.  By default we
-    # use in-memory storage so deployments without a writable home
-    # directory (containers, serverless) work out of the box.
+    # client registrations, and refresh token mappings.
     #
-    # Set FASTMCP_HOME to point to a writable directory to switch to
+    # Set FASTMCP_HOME to point to a writable directory to use
     # persistent encrypted file storage that survives restarts.
+    # When unset, FastMCP uses its default storage location.
     #
     # FastMCP reads settings.home at import time, so we must sync it
     # with the runtime FASTMCP_HOME value before constructing the
@@ -124,11 +136,9 @@ def setup_auth():
     fastmcp_home = os.environ.get("FASTMCP_HOME", "").strip()
     if fastmcp_home:
         fastmcp_settings.home = Path(fastmcp_home)
-        client_storage = None  # GitHubProvider creates encrypted file store at settings.home
         print(f"OAuth storage: persistent (FASTMCP_HOME={fastmcp_home})", file=sys.stderr)
     else:
-        client_storage = MemoryStore()
-        print("OAuth storage: in-memory (set FASTMCP_HOME for persistent storage)", file=sys.stderr)
+        print("OAuth storage: default (set FASTMCP_HOME for custom location)", file=sys.stderr)
 
     # ── Build OAuth components ────────────────────────────────────────
     # OAuth 2.1 proxy: full DCR + PKCE + CIMD flow through GitHub OAuth App
@@ -139,7 +149,6 @@ def setup_auth():
         required_scopes=github_oauth_scopes,
         allowed_github_logins=allowed_github_logins,
         audit_logging_enabled=audit_logging_enabled,
-        client_storage=client_storage,
     )
 
     # OAuth 2.0 raw token: direct GitHub token validation via API
@@ -154,11 +163,17 @@ def setup_auth():
     verifiers: list = [raw_token_verifier]
 
     if need_token_auth:
-        static_verifier = build_token_verifier(
-            mcp_api_token=mcp_api_token,
-            audit_logging_enabled=audit_logging_enabled,
-        )
-        verifiers.insert(0, static_verifier)
+        if policy_db_configured:
+            # Per-user tokens from the policy database (primary)
+            db_verifier = DbTokenVerifier(audit_logging_enabled=audit_logging_enabled)
+            verifiers.insert(0, db_verifier)
+        if mcp_api_token:
+            # Static token as additional fallback
+            static_verifier = build_static_token_verifier(
+                mcp_api_token=mcp_api_token,
+                audit_logging_enabled=audit_logging_enabled,
+            )
+            verifiers.insert(0, static_verifier)
 
     # MultiAuth tries the server first, then each verifier in order.
     # Order: proxy (GitHubProvider) → static token → raw GitHub token

@@ -59,9 +59,10 @@ ALLOWED_GITHUB_LOGINS=<your-github-login>
 
 ## OAuth Storage
 
-By default, OAuth state (client registrations, tokens, sessions) is stored **in-memory**. This works out of the box but is lost on server restart — users must re-authenticate.
-
-Set `FASTMCP_HOME` to a writable directory for **persistent encrypted file storage** that survives restarts. In Docker, mount a volume at that path:
+OAuth state (client registrations, tokens, sessions) is stored by FastMCP at
+its configured home directory. Set `FASTMCP_HOME` to a writable directory for
+**persistent encrypted file storage** that survives restarts. In Docker, mount
+a volume at that path:
 
 ```yaml
 services:

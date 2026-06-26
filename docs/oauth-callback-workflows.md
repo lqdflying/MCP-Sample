@@ -4,7 +4,7 @@ This document describes the three authentication paths supported by the MCP serv
 
 ---
 
-## Authentication Chain (FastMCP 3.3.1 MultiAuth)
+## Authentication Chain (FastMCP 3.3.1+ MultiAuth)
 
 Every incoming request passes through `MultiAuth` in order:
 
@@ -89,8 +89,8 @@ https://your-domain/auth/callback
 
 ### Persistence
 
-- **Without `FASTMCP_HOME`**: in-memory storage (safe for read-only filesystems). All sessions lost on restart — clients must re-authenticate.
-- **With `FASTMCP_HOME`**: persistent encrypted file storage (Fernet). Survives restarts. Recommended for production.
+- **Without `FASTMCP_HOME`**: FastMCP uses its default storage location. Sessions may be lost on restart depending on platform.
+- **With `FASTMCP_HOME`**: persistent encrypted file storage (Fernet) at the specified path. Survives restarts. Recommended for production.
 
 ---
 
